@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+# fpdoc - check and set up fingerprint readers on linux
+# usage: fpdoc [check|setup|enroll|enable|disable|report] [-y] [-n]
+
+set -u
+
+version=0.3.1
+prog=${0##*/}
+
+# handy for testing another distro without having one
+osrel=${FPDOC_OS_RELEASE:-/etc/os-release}
+usbdir=${FPDOC_USB_DIR:-/sys/bus/usb/devices}
+pm=${FPDOC_PM:-}
+
+assume_yes=0
+dry_run=0
+
+# usb vendors that make fingerprint readers. a few also make touchpads and
+# other things, so this is only a hint. fprintd-list is the real test
+fp_vendors="06cb 27c6 138a 04f3 1c7a 08ff 147e 05ba 2808 10a5"
+not_fp='bluetooth|camera|webcam|hub|mouse|keyboard|wireless|receiver'
+
+if [[ -t 1 ]]; then
+  g=$'\e[32m' y=$'\e[33m' r=$'\e[31m' o=$'\e[0m'
+else
+  g='' y='' r='' o=''
+fi
+info() { echo "[i] $*"; }
+ok()   { echo "${g}[ok]${o} $*"; }
+warn() { echo "${y}[!]${o} $*"; }
+err()  { echo "${r}[x]${o} $*" >&2; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+ask() {
+  local a
+  (( assume_yes )) && return 0
+  read -r -p "$1 [y/N] " a
+  [[ $a == [Yy]* ]]
+}
+
+usage() {
+  cat <<EOF
+$prog $version
+
+usage: $prog [command] [-y] [-n]
+
+  check    look at the reader, libfprint and PAM, change nothing (default)
+  setup    install packages, enroll a finger, enable it for login/sudo
+  enroll   enroll a fingerprint
+  enable   turn on fingerprint auth in PAM
+  disable  turn it off again
+  report   print info to paste into a bug report
+
+  -y  say yes to every question
+  -n  dry run, just print the commands that would change something
+EOF
+}
+
+run_root() {
+  if (( dry_run )); then echo "+ sudo $*"; return 0; fi
+  if [[ $EUID -eq 0 ]]; then "$@"
+  elif have sudo; then sudo "$@"
+  elif have doas; then doas "$@"
+  else err "need root, install sudo or doas"; return 1
+  fi
+}
+
+# read one variable from os-release
+osinfo() {
+  # shellcheck source=/dev/null
+  ( . "$osrel" 2>/dev/null; echo "${!1:-}" )
+}
+
+# TODO: apk, xbps and emerge backends
+detect_pm() {
+  local ids c
+  [[ -n $pm ]] && return
+  [[ -e /run/ostree-booted ]] && { pm=ostree; return; }
+
+  ids=" $(osinfo ID) $(osinfo ID_LIKE) "
+  case $ids in
+    *" nixos "*)                          pm=nix ;;
+    *" debian "*|*" ubuntu "*)            pm=apt ;;
+    *" fedora "*|*" rhel "*|*" centos "*) pm=dnf ;;
+    *" arch "*)                           pm=pacman ;;
+    *" suse "*|*" opensuse "*)            pm=zypper ;;
+    *" alpine "*)                         pm=apk ;;
+    *" void "*)                           pm=xbps ;;
+    *" gentoo "*)                         pm=emerge ;;
+  esac
+  [[ -n $pm ]] && return
+
+  # unknown distro, go by what's installed
+  for c in apt-get:apt dnf:dnf pacman:pacman zypper:zypper apk:apk xbps-install:xbps emerge:emerge; do
+    have "${c%%:*}" && { pm=${c##*:}; return; }
+  done
+  pm=unknown
+}
+
+support() {
+  case $pm in
+    apt|dnf|zypper) echo "automated" ;;
+    pacman)         echo "install automated, PAM by hand" ;;
+    *)              echo "instructions only" ;;
+  esac
+}
+
+libfprint_pkg() {
+  case $pm in
+    apt|zypper) echo libfprint-2-2 ;;
+    dnf|pacman) echo libfprint ;;
+  esac
+}
+
+pkg_version() {
+  local v
+  case $pm in
+    apt)        dpkg-query -W -f='${Version}' "$1" 2>/dev/null ;;
+    dnf|zypper) v=$(rpm -q --qf '%{VERSION}' "$1" 2>/dev/null) && echo "$v" ;;
+    pacman)     pacman -Q "$1" 2>/dev/null | awk '{print $2}' ;;
+  esac
+}
+
+# 1:1.94.4+tod1-0ubuntu1~22.04.2 -> 1.94.4
+upstream() {
+  sed -E 's/^[0-9]+://; s/^([0-9]+(\.[0-9]+)*).*/\1/' <<<"$1"
+}
+
+# is $1 >= $2, plain string compare gets 1.94.10 vs 1.94.7 wrong
+ver_ge() {
+  [[ $(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1) == "$2" ]]
+}
+
+pm_install() {
+  case $pm in
+    apt)
+      run_root apt-get update || warn "apt update had problems, going on anyway"
+      run_root apt-get install -y fprintd libpam-fprintd libfprint-2-2 ;;
+    dnf)
+      run_root dnf install -y fprintd fprintd-pam ;;
+    zypper)
+      run_root zypper --non-interactive refresh || warn "zypper refresh had problems, going on anyway"
+      run_root zypper --non-interactive install fprintd fprintd-pam libfprint-2-2 ;;
+    pacman)
+      # no standard pam tool on arch, so only the install is automatic
+      run_root pacman -S --needed --noconfirm fprintd ;;
+    *)
+      by_hand; return 2 ;;
+  esac
+}
+
+pam_enable() {
+  case $pm in
+    apt)
+      run_root pam-auth-update --enable fprintd ;;
+    dnf)
+      if (( ! dry_run )); then
+        have authselect || { warn "no authselect here"; pam_by_hand; return 2; }
+        authselect current >/dev/null 2>&1 || { warn "authselect has no active profile"; pam_by_hand; return 2; }
+      fi
+      run_root authselect enable-feature with-fingerprint || return 1
+      run_root authselect apply-changes || true ;;
+    zypper)
+      run_root pam-config --add --fprintd ;;
+    *)
+      pam_by_hand; return 2 ;;
+  esac
+}
+
+pam_disable() {
+  case $pm in
+    apt)    run_root pam-auth-update --disable fprintd ;;
+    dnf)    run_root authselect disable-feature with-fingerprint ;;
+    zypper) run_root pam-config --delete --fprintd ;;
+    *)      warn "remove the pam_fprintd.so line from /etc/pam.d by hand"; return 2 ;;
+  esac
+}
+
+by_hand() {
+  warn "no automatic setup for '$pm' yet, here's what to do:"
+  case $pm in
+    nix)
+      cat <<'EOF'
+   put this in your configuration and run 'sudo nixos-rebuild switch':
+       services.fprintd.enable = true;
+   nixos builds /etc/pam.d from the config, so don't edit it by hand.
+   after that: fpdoc enroll
+EOF
+      ;;
+    ostree)
+      cat <<'EOF'
+   immutable system, so layer the packages and reboot. on fedora atomic
+   (silverblue, kinoite) that's usually:
+       rpm-ostree install fprintd fprintd-pam
+       systemctl reboot
+       sudo authselect enable-feature with-fingerprint
+   after that: fpdoc enroll
+EOF
+      ;;
+    *)
+      cat <<'EOF'
+   1. install fprintd, and its PAM module if that's a separate package
+      (fprintd-pam, libpam-fprintd, ...)
+   2. keep libfprint up to date, newer sensors need newer versions
+   3. fpdoc enroll
+EOF
+      pam_by_hand
+      ;;
+  esac
+}
+
+pam_by_hand() {
+  cat <<'EOF'
+   to use it for login/sudo, add this near the top of the auth section in the
+   PAM files you care about (/etc/pam.d/sudo, your login manager, lock screen):
+       auth  sufficient  pam_fprintd.so
+   keep a root shell open while testing so a typo can't lock you out.
+EOF
+}
+
+usb_list() {
+  local d v p m n
+  if have lsusb; then
+    lsusb | sed -E 's/^Bus [0-9]+ Device [0-9]+: ID //'
+    return
+  fi
+  # no usbutils, read sysfs instead
+  for d in "$usbdir"/*; do
+    [[ -r $d/idVendor && -r $d/idProduct ]] || continue
+    v=$(<"$d/idVendor"); p=$(<"$d/idProduct"); m=; n=
+    [[ -r $d/manufacturer ]] && m=$(<"$d/manufacturer")
+    [[ -r $d/product ]] && n=$(<"$d/product")
+    echo "$v:$p $m $n"
+  done
+}
+
+find_readers() {
+  local line vendor
+  while IFS= read -r line; do
+    [[ -z $line ]] && continue
+    vendor=${line%%:*}
+    if grep -qi finger <<<"$line"; then
+      echo "$line"
+    elif [[ " $fp_vendors " == *" ${vendor,,} "* ]] && ! grep -qiE "$not_fp" <<<"$line"; then
+      echo "$line"
+    fi
+  done < <(usb_list)
+}
+
+# sensors that need a newer libfprint than some distros ship. from the
+# libfprint 1.94.7 release notes, not confirmed on real hardware yet
+min_libfprint() {
+  case ${1,,} in
+    06cb:0124|06cb:0173|06cb:0106) echo 1.94.7 ;;
+  esac
+}
+
+fprintd_sees_device() {
+  have fprintd-list && fprintd-list "$USER" 2>&1 | grep -q "Device at"
+}
+
+pam_files() {
+  grep -rls pam_fprintd /etc/pam.d 2>/dev/null | head -n3 | tr '\n' ' '
+}
+
+cmd_check() {
+  local readers lv="" uv="" pkg line id min pf distro
+
+  distro=$(osinfo PRETTY_NAME)
+  info "${distro:-unknown distro}, kernel $(uname -r)"
+  info "package manager: $pm ($(support))"
+
+  readers=$(find_readers)
+  if [[ -z $readers ]]; then
+    warn "no likely fingerprint reader in the USB devices"
+    warn "readers on I2C/SPI don't show up here"
+  else
+    info "possible reader:"
+    while IFS= read -r line; do echo "      $line"; done <<<"$readers"
+  fi
+
+  pkg=$(libfprint_pkg)
+  if [[ -z $pkg ]]; then
+    info "libfprint version: not checked on '$pm', look it up with your package manager"
+  else
+    lv=$(pkg_version "$pkg")
+    if [[ -z $lv ]]; then
+      warn "libfprint isn't installed ($prog setup)"
+    else
+      uv=$(upstream "$lv")
+      info "libfprint $uv (package version $lv)"
+    fi
+  fi
+
+  while IFS= read -r line; do
+    [[ -z $line ]] && continue
+    id=${line%% *}
+    min=$(min_libfprint "$id")
+    if [[ -z $min ]]; then
+      info "$id: no notes on this one, see https://fprint.freedesktop.org/supported-devices.html"
+    elif [[ -n $uv ]] && ! ver_ge "$uv" "$min"; then
+      warn "$id needs libfprint $min or newer, you have $uv"
+    else
+      ok "$id should work with libfprint $min or newer (not confirmed on hardware yet)"
+    fi
+  done <<<"$readers"
+
+  if have fprintd-list; then
+    if fprintd_sees_device; then
+      ok "fprintd sees the reader"
+      fprintd-list "$USER" 2>&1 | grep -q "no fingers enrolled" && info "no fingers enrolled ($prog enroll)"
+    else
+      warn "fprintd doesn't see a reader (libfprint too old, or sensor not supported)"
+    fi
+  else
+    info "fprintd isn't installed"
+  fi
+
+  pf=$(pam_files)
+  if [[ -n $pf ]]; then
+    ok "pam_fprintd is used in: $pf"
+  else
+    info "fingerprint isn't enabled in PAM"
+  fi
+}
+
+cmd_enroll() {
+  if [[ $EUID -eq 0 ]]; then err "run enroll as your normal user, not root"; return 1; fi
+  if ! fprintd_sees_device; then
+    err "fprintd doesn't see a reader, so there's nothing to enroll. try: $prog check"
+    return 1
+  fi
+  info "touch or swipe the sensor when asked, a few times"
+  fprintd-enroll && fprintd-verify
+}
+
+cmd_enable() {
+  local rc
+  pam_enable; rc=$?
+  if (( rc == 0 && ! dry_run )); then
+    if [[ -n $(pam_files) ]]; then
+      ok "enabled, your password still works as a fallback"
+    else
+      warn "can't find pam_fprintd in /etc/pam.d, check by hand"
+    fi
+  fi
+  return $rc
+}
+
+cmd_disable() {
+  pam_disable && ok "fingerprint auth turned off"
+}
+
+cmd_setup() {
+  local rc
+  if [[ $EUID -eq 0 ]] && (( ! dry_run )); then
+    err "run this as your normal user, it calls sudo when needed"
+    exit 1
+  fi
+
+  cmd_check
+  echo
+  ask "install/upgrade the fingerprint packages?" || { info "ok, stopping"; return 0; }
+
+  pm_install; rc=$?
+  (( rc == 2 )) && return 0
+  (( rc != 0 )) && { err "install failed"; return 1; }
+
+  # dbus normally starts fprintd on demand, this is just in case
+  if (( ! dry_run )) && have systemctl && [[ -d /run/systemd/system ]]; then
+    run_root systemctl restart fprintd 2>/dev/null || true
+  fi
+
+  if (( dry_run )); then
+    echo
+    ask "enable it for login and sudo?" && cmd_enable
+    info "dry run, nothing was changed"
+    return 0
+  fi
+
+  echo
+  if ! fprintd_sees_device; then
+    err "fprintd still doesn't see a reader after the install"
+    [[ $pm == pacman ]] && info "on arch an old package db can leave libfprint outdated, try: sudo pacman -Syu"
+    info "run '$prog report' and open an issue with the output"
+    return 1
+  fi
+  ok "reader found"
+
+  if fprintd-list "$USER" 2>&1 | grep -q "no fingers enrolled"; then
+    ask "enroll a finger now?" && cmd_enroll
+  fi
+  ask "enable it for login and sudo?" && cmd_enable
+  echo
+  ok "done. to test: sudo -k && sudo true"
+}
+
+cmd_report() {
+  local pkg
+  pkg=$(libfprint_pkg)
+  {
+    echo "fpdoc $version"
+    echo "os: $(osinfo PRETTY_NAME)"
+    echo "kernel: $(uname -r)"
+    echo "backend: $pm"
+    echo "laptop: $(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || echo unknown)"
+    [[ -n $pkg ]] && echo "libfprint: $(pkg_version "$pkg")"
+    echo "fprintd: $(pkg_version fprintd)"
+    echo
+    echo "possible readers:"
+    find_readers
+    echo
+    echo "fprintd-list:"
+    have fprintd-list && fprintd-list "$USER" 2>&1
+    echo
+    echo "fprintd log:"
+    have journalctl && journalctl -u fprintd -b --no-pager 2>/dev/null | tail -n 30
+  } 2>&1 | sed "s/${USER:-nobody}/<user>/g"
+}
+
+cmd=check
+for a in "$@"; do
+  case $a in
+    -y) assume_yes=1 ;;
+    -n|--dry-run) dry_run=1 ;;
+    -h|--help|help) usage; exit 0 ;;
+    check|setup|enroll|enable|disable|report) cmd=$a ;;
+    *) err "don't know '$a'"; usage; exit 1 ;;
+  esac
+done
+
+detect_pm
+"cmd_$cmd"
