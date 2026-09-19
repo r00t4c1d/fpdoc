@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # fpdoc - check and set up fingerprint readers on linux
-# usage: fpdoc [check|setup|enroll|enable|disable|report] [-y] [-n]
+# usage: fpdoc [check|setup|enroll|list|delete|enable|disable] [-y] [-n]
 
 set -u
 
@@ -57,7 +57,6 @@ usage: $prog [command] [-y] [-n]
   delete [finger|all]   remove enrolled fingerprints
   enable                turn on fingerprint auth in PAM
   disable               turn it off again
-  report                print info to paste into a bug report
 
   -y  say yes to every question
   -n  dry run, just print the commands that would change something
@@ -482,7 +481,7 @@ cmd_setup() {
   if ! fprintd_sees_device; then
     err "fprintd still doesn't see a reader after the install"
     [[ $pm == pacman ]] && info "on arch an old package db can leave libfprint outdated, try: sudo pacman -Syu"
-    info "run '$prog report' and open an issue with the output"
+    info "check your sensor at https://fprint.freedesktop.org/supported-devices.html"
     return 1
   fi
   ok "reader found"
@@ -495,29 +494,6 @@ cmd_setup() {
   ok "done. to test: sudo -k && sudo true"
 }
 
-cmd_report() {
-  local pkg
-  pkg=$(libfprint_pkg)
-  {
-    echo "fpdoc $version"
-    echo "os: $(osinfo PRETTY_NAME)"
-    echo "kernel: $(uname -r)"
-    echo "backend: $pm"
-    echo "laptop: $(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || echo unknown)"
-    [[ -n $pkg ]] && echo "libfprint: $(pkg_version "$pkg")"
-    echo "fprintd: $(pkg_version fprintd)"
-    echo
-    echo "possible readers:"
-    find_readers
-    echo
-    echo "fprintd-list:"
-    have fprintd-list && fprintd-list "$user" 2>&1
-    echo
-    echo "fprintd log:"
-    have journalctl && journalctl -u fprintd -b --no-pager 2>/dev/null | tail -n 30
-  } 2>&1 | sed "s/${user}/<user>/g"
-}
-
 cmd=check
 target=
 finger=
@@ -526,7 +502,7 @@ for a in "$@"; do
     -y) assume_yes=1 ;;
     -n|--dry-run) dry_run=1 ;;
     -h|--help|help) usage; exit 0 ;;
-    check|setup|enroll|enable|disable|report|list|delete) cmd=$a ;;
+    check|setup|enroll|enable|disable|list|delete) cmd=$a ;;
     all) target=all ;;
     *)
       if is_finger "$a"; then target=$a
