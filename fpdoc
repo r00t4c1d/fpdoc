@@ -4,7 +4,7 @@
 
 set -u
 
-version=0.3.1
+version=0.4.0
 prog=${0##*/}
 
 # handy for testing another distro without having one
@@ -12,8 +12,13 @@ osrel=${FPDOC_OS_RELEASE:-/etc/os-release}
 usbdir=${FPDOC_USB_DIR:-/sys/bus/usb/devices}
 pm=${FPDOC_PM:-}
 
+user=${USER:-$(id -un)}
 assume_yes=0
 dry_run=0
+
+# fprintd only accepts these ten names, there's no way to add your own
+fingers=(left-thumb left-index-finger left-middle-finger left-ring-finger left-little-finger
+         right-thumb right-index-finger right-middle-finger right-ring-finger right-little-finger)
 
 # usb vendors that make fingerprint readers. a few also make touchpads and
 # other things, so this is only a hint. fprintd-list is the real test
@@ -45,15 +50,19 @@ $prog $version
 
 usage: $prog [command] [-y] [-n]
 
-  check    look at the reader, libfprint and PAM, change nothing (default)
-  setup    install packages, enroll a finger, enable it for login/sudo
-  enroll   enroll a fingerprint
-  enable   turn on fingerprint auth in PAM
-  disable  turn it off again
-  report   print info to paste into a bug report
+  check                 look at the reader, libfprint and PAM, change nothing (default)
+  setup                 install packages, enroll a finger, enable it for login/sudo
+  enroll [finger]       enroll a fingerprint, asks which finger if you don't say
+  list                  show which fingers are enrolled
+  delete [finger|all]   remove enrolled fingerprints
+  enable                turn on fingerprint auth in PAM
+  disable               turn it off again
+  report                print info to paste into a bug report
 
   -y  say yes to every question
   -n  dry run, just print the commands that would change something
+
+fingers: ${fingers[*]}
 EOF
 }
 
@@ -257,7 +266,39 @@ min_libfprint() {
 }
 
 fprintd_sees_device() {
-  have fprintd-list && fprintd-list "$USER" 2>&1 | grep -q "Device at"
+  have fprintd-list && fprintd-list "$user" 2>&1 | grep -q "Device at"
+}
+
+is_finger() {
+  local f
+  for f in "${fingers[@]}"; do [[ $f == "$1" ]] && return 0; done
+  return 1
+}
+
+enrolled_fingers() {
+  have fprintd-list || return 0
+  fprintd-list "$user" 2>&1 | grep -oE '(left|right)-(thumb|index-finger|middle-finger|ring-finger|little-finger)'
+}
+
+# sets $finger, asks with a numbered list
+pick_finger() {
+  local i a mark enrolled
+  enrolled=$(enrolled_fingers)
+  for i in "${!fingers[@]}"; do
+    mark=
+    grep -qx "${fingers[i]}" <<<"$enrolled" && mark="  (enrolled)"
+    printf '  %2d) %s%s\n' $((i + 1)) "${fingers[i]}" "$mark"
+  done
+  read -r -p "number or name [right-index-finger]: " a
+  a=${a:-right-index-finger}
+  if [[ $a =~ ^[0-9]+$ ]] && (( a >= 1 && a <= ${#fingers[@]} )); then
+    finger=${fingers[a-1]}
+  elif is_finger "$a"; then
+    finger=$a
+  else
+    err "'$a' isn't a finger name or a number from the list"
+    return 1
+  fi
 }
 
 pam_files() {
@@ -265,7 +306,7 @@ pam_files() {
 }
 
 cmd_check() {
-  local readers lv="" uv="" pkg line id min pf distro
+  local readers lv="" uv="" pkg line id min pf distro enrolled
 
   distro=$(osinfo PRETTY_NAME)
   info "${distro:-unknown distro}, kernel $(uname -r)"
@@ -309,7 +350,8 @@ cmd_check() {
   if have fprintd-list; then
     if fprintd_sees_device; then
       ok "fprintd sees the reader"
-      fprintd-list "$USER" 2>&1 | grep -q "no fingers enrolled" && info "no fingers enrolled ($prog enroll)"
+      enrolled=$(enrolled_fingers | tr '\n' ' ')
+      if [[ -n $enrolled ]]; then info "enrolled: $enrolled"; else info "no fingers enrolled ($prog enroll)"; fi
     else
       warn "fprintd doesn't see a reader (libfprint too old, or sensor not supported)"
     fi
@@ -331,8 +373,65 @@ cmd_enroll() {
     err "fprintd doesn't see a reader, so there's nothing to enroll. try: $prog check"
     return 1
   fi
+
+  finger=$target
+  if [[ -z $finger ]] && (( ! assume_yes )) && [[ -t 0 ]]; then
+    pick_finger || return 1
+  fi
+
   info "touch or swipe the sensor when asked, a few times"
-  fprintd-enroll && fprintd-verify
+  if [[ -n $finger ]]; then
+    fprintd-enroll -f "$finger" || return 1
+  else
+    fprintd-enroll || return 1
+  fi
+  fprintd-verify
+}
+
+cmd_list() {
+  have fprintd-list || { err "fprintd isn't installed ($prog setup)"; return 1; }
+  fprintd-list "$user"
+}
+
+cmd_delete() {
+  local t=$target enrolled
+  have fprintd-delete || { err "fprintd isn't installed"; return 1; }
+
+  enrolled=$(enrolled_fingers)
+  if [[ -z $enrolled ]]; then
+    info "no fingers enrolled, nothing to delete"
+    return 0
+  fi
+
+  if [[ -z $t ]]; then
+    if (( assume_yes )) || [[ ! -t 0 ]]; then
+      err "say which finger, or 'all': $prog delete all"
+      return 1
+    fi
+    echo "enrolled:"
+    while IFS= read -r t; do echo "   $t"; done <<<"$enrolled"
+    t=
+    read -r -p "delete which? (finger name, or 'all') " t
+  fi
+
+  if [[ $t == all ]]; then
+    ask "delete ALL enrolled fingerprints for $user?" || { info "ok, nothing deleted"; return 0; }
+    if (( dry_run )); then echo "+ fprintd-delete $user"; return 0; fi
+    fprintd-delete "$user" && ok "all fingerprints deleted"
+  elif is_finger "$t"; then
+    if ! grep -qx "$t" <<<"$enrolled"; then err "$t isn't enrolled"; return 1; fi
+    ask "delete $t?" || { info "ok, nothing deleted"; return 0; }
+    if (( dry_run )); then echo "+ fprintd-delete $user --finger $t"; return 0; fi
+    if fprintd-delete "$user" --finger "$t"; then
+      ok "$t deleted"
+    else
+      warn "older fprintd versions can't delete a single finger, '$prog delete all' works there"
+      return 1
+    fi
+  else
+    err "'$t' isn't a finger name (or 'all')"
+    return 1
+  fi
 }
 
 cmd_enable() {
@@ -388,7 +487,7 @@ cmd_setup() {
   fi
   ok "reader found"
 
-  if fprintd-list "$USER" 2>&1 | grep -q "no fingers enrolled"; then
+  if fprintd-list "$user" 2>&1 | grep -q "no fingers enrolled"; then
     ask "enroll a finger now?" && cmd_enroll
   fi
   ask "enable it for login and sudo?" && cmd_enable
@@ -412,21 +511,27 @@ cmd_report() {
     find_readers
     echo
     echo "fprintd-list:"
-    have fprintd-list && fprintd-list "$USER" 2>&1
+    have fprintd-list && fprintd-list "$user" 2>&1
     echo
     echo "fprintd log:"
     have journalctl && journalctl -u fprintd -b --no-pager 2>/dev/null | tail -n 30
-  } 2>&1 | sed "s/${USER:-nobody}/<user>/g"
+  } 2>&1 | sed "s/${user}/<user>/g"
 }
 
 cmd=check
+target=
+finger=
 for a in "$@"; do
   case $a in
     -y) assume_yes=1 ;;
     -n|--dry-run) dry_run=1 ;;
     -h|--help|help) usage; exit 0 ;;
-    check|setup|enroll|enable|disable|report) cmd=$a ;;
-    *) err "don't know '$a'"; usage; exit 1 ;;
+    check|setup|enroll|enable|disable|report|list|delete) cmd=$a ;;
+    all) target=all ;;
+    *)
+      if is_finger "$a"; then target=$a
+      else err "don't know '$a'"; usage; exit 1
+      fi ;;
   esac
 done
 
